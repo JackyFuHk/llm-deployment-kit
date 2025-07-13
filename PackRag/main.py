@@ -7,14 +7,12 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from transformers import AutoTokenizer, pipeline, AutoModelForCausalLM,AutoModel
 from glob import glob
-import pdfplumber
+from pypdf import PdfReader
 import torch
 from langchain.vectorstores import Qdrant
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
-app = FastAPI()
-
-
+import uuid
 
 class RagSystem:
     def __init__(self,embedding_model_name = "/mnt/f/ubuntu/deployment/model/bge-base-en-v1___5",reranker_model_name = "/mnt/f/ubuntu/deployment/model/bge-reranker-base"):
@@ -41,15 +39,16 @@ class RagSystem:
                     distance=Distance.COSINE  # cosine distance
                 )
             )
-    
+
     def read_pdf(self,pdf_path):
         text_list = []
-        with pdfplumber.open(pdf_path) as pdf:
-            text = pdf.extract_text()
-            text_list.append(text)
+        reader = PdfReader(pdf_path)
+        number_of_pages = len(reader.pages)
+        for i in range(number_of_pages):
+            page = reader.pages[0]
+            text_list.append(page.extract_text())
         return text_list
                 
-
     def chunk_doc(self,text:str,max_chunk_size=512):
         # chunk document into small chucks for indexing by punctuations
         chucks = text.split("\n")
@@ -65,93 +64,63 @@ class RagSystem:
         embedding = outputs.last_hidden_state[:, 0, :].squeeze().tolist()
         return embedding
 
-
-
-def init_rag():
-    # 读取文本数据，切块，分为
-    contract_datas = glob("./data/contract/*.pdf")
-    invoice_datas = glob("./data/invoice/*.jpg")
-    product_datas = glob("./data/product_info/*.pdf")
-
-    # 处理合同数据，自动判断是哪种数据形式。
-    for contract_data in contract_datas:
-        # 合同数据，转文本，存数据库
-        extract_pdf(contract_data,"contract")
+    def save_e(self, points: list):
+        self.client.upsert(
+            collection_name=self.collection_name,
+            points=points
+        )   
     
-    for invoice_data in invoice_datas:
-        # 都是图片，要用OCR识别文字，转表格，转html，存入数据库。
-        pass
+    def search_e(self, query: str, top_k: int = 10) -> list:
+        # search embedding in vector store
+        query_embedding = self.get_embedding(query)
+        results = self.client.search(
+            collection_name=self.collection_name,
+            points=query_embedding,
+            top=top_k,
+            include_distances=True
+        )
+        return results
 
-    for product_data in product_datas:
-        # 全部都是文字信息。基础按段落分块，
-        extract_pdf(product_data,"product_info")
+    def rerank(self, query: str, doc_ids: list) -> list:
+        # rerank documents by bge reranker
+        inputs = self.tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=512)
+        outputs = self.reranker_model(**inputs)
+        rerank_scores = outputs.logits.squeeze().tolist()
+        # rerank_scores = [1.0 for _ in doc_ids]  # use uniform score
+        sorted_doc_ids = [doc_id for _, doc_id in sorted(zip(rerank_scores, doc_ids), key=lambda x: x[0], reverse=True)]
+        return sorted_doc_ids
 
-def extract_pdf(pdf_path,data_type):
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            chucks = text.split("\n")
-            vectors = [get_embedding(chunk) for chunk in chucks]
-            # 构造 Qdrant 的点（Point）结构
-            points = [
-                PointStruct(
-                    id=idx,  # 唯一ID（可以是自增数字或UUID）
-                    vector=vector,
-                    payload={"text": text,"data_type":data_type}  # 附加元数据
-                )
-                for idx, (text, vector) in enumerate(zip(chucks, vectors))
-            ]
-
-            # 批量插入数据
-            client.upsert(
-                collection_name=collection_name,
-                points=points
-            )
+    def search(self, query: str, top_k: int = 10) -> list:
+        # search documents by embedding and reranking
+        results = self.search_e(query, top_k)
+        sorted_doc_ids = self.rerank(query, [doc_id for doc_id, _ in results])
+        return sorted_doc_ids[:top_k]
 
 
-            # table = page.extract_table()
-            # print(table)
-
-
-
-
-
-
-query_text = "what material is used for the double wall paper cup?"
-query_vector = get_embedding(query_text)
-
-# 相似性搜索
-hits = client.query_points(
-    collection_name=collection_name,
-    query_vector=query_vector,
-    limit=5,  # 返回前5个结果
-    with_payload=True,  # 返回元数据
-    with_vectors=False,  # 不返回向量（节省带宽）
-)
-# 打印结果
-for hit in hits:
-    print(f"ID: {hit.id}, 相似度: {hit.score:.4f}")
-    print(f"文本: {hit.payload['text']}\n---")
-
-
-
-
-
-
-# class Input(BaseModel):
-#     prompt: str
-
-# @app.post("/query/")
-# async def chat(input: Input):
-#     prompt = input.prompt
-#     # 检索内容（元数据筛选）
-
-#     # 语言模型生成文本
-
+if __name__ == '__main__':
+    my_rag_system = RagSystem()
+    # read pdf file
+    pdf_path = "/mnt/f/ubuntu/deployment/PackRag/dataset/double wall paper cup detail.pdf"
+    # chunk document into small chucks for indexing by punctuations
+    chunks_list = []
+    text_list = my_rag_system.read_pdf(pdf_path)
+    for text in text_list:
+        chunks = my_rag_system.chunk_doc(text)
+        chunks_list.append(chunks)
+    # save embedding to vector store
+    points = []
+    for i, chunks in enumerate(chunks_list):
+        doc_id = uuid.uuid4().hex
+        points.append(
+        PointStruct(
+            id=doc_id,
+            vector = my_rag_system.get_embedding(chunks),
+            payload = {"product_name":"Double wall paper cup"}
+        ))
+    my_rag_system.save_e(points)
     
-#     return {"response": "Hello, world!"}
-
-
-
-# if __name__ == '__main__':
-#     uvicorn.run(app, host='0.0.0.0', port=8000)
+    while True:
+        query = input("input query: ")
+        results = my_rag_system.search(query, top_k = 10)
+        print(results)
+   
