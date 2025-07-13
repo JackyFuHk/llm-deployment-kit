@@ -41,8 +41,7 @@ import time
 import torch
 app = FastAPI()
 
-app.mount("/metrics", metrics_app)  # 暴露指标端点
-
+app.mount("/metrics/", metrics_app)  # 暴露指标端点
 
 class Input(BaseModel):
     prompt: str
