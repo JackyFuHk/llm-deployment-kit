@@ -14,40 +14,58 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 app = FastAPI()
 
-# 转矢量模型用bge
-embedding_model_name = "/mnt/f/ubuntu/deployment/model/bge-base-en-v1___5"
-tokenizer = AutoTokenizer.from_pretrained(embedding_model_name,trust_remote_code=True,local_files_only=True)
-model = AutoModel.from_pretrained(embedding_model_name)
 
-# reranker
-reranker_model_name = "/mnt/f/ubuntu/deployment/model/bge-reranker-base"
-reranker_model = AutoModel.from_pretrained(embedding_model_name,trust_remote_code=True,local_files_only=True)
 
-# vector store
-client = QdrantClient(":memory:")  # 内存模式（测试用）
-collection_name = "my_collection"
-vector_size = 768  # BGE模型的向量维度（base模型为768，large为1024）
+class RagSystem:
+    def __init__(self,embedding_model_name = "/mnt/f/ubuntu/deployment/model/bge-base-en-v1___5",reranker_model_name = "/mnt/f/ubuntu/deployment/model/bge-reranker-base"):
+        # emebdding model use bge
+        self.embedding_model_name = embedding_model_name
+        self.tokenizer = AutoTokenizer.from_pretrained(self.embedding_model_name,trust_remote_code=True,local_files_only=True)
+        self.model = AutoModel.from_pretrained(self.embedding_model_name)
 
-# 检查集合是否存在，不存在则创建
-if not client.collection_exists(collection_name):
-    client.create_collection(
-        collection_name=collection_name,
-        vectors_config=VectorParams(
-            size=vector_size,
-            distance=Distance.COSINE  # 使用余弦相似度
-        )
-    )
+        # bge reranker 
+        self.reranker_model_name = reranker_model_name
+        self.reranker_model = AutoModel.from_pretrained(self.embedding_model_name,trust_remote_code=True,local_files_only=True)
 
-def get_embedding(text: str) -> list:
-    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
-    with torch.no_grad():
-        outputs = model(**inputs)
-    # 取 [CLS] 位置的向量作为句子表示
-    embedding = outputs.last_hidden_state[:, 0, :].squeeze().tolist()
-    return embedding
+        # vector store
+        self.client = QdrantClient(":memory:")  # test mode, user memory mode for real use
+        self.collection_name = "my_collection"
+        self.vector_size = 768  # bge embedding size nomally 768 or 1024
 
-def get_sigle_embedding(text: str) -> list:
-    return get_embedding([text])[0]
+        # check collection and create if not exist
+        if not self.client.collection_exists(self.collection_name):
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(
+                    size=self.vector_size,
+                    distance=Distance.COSINE  # cosine distance
+                )
+            )
+    
+    def read_pdf(self,pdf_path):
+        text_list = []
+        with pdfplumber.open(pdf_path) as pdf:
+            text = pdf.extract_text()
+            text_list.append(text)
+        return text_list
+                
+
+    def chunk_doc(self,text:str,max_chunk_size=512):
+        # chunk document into small chucks for indexing by punctuations
+        chucks = text.split("\n")
+        chucks = [chunk for chunk in chucks if len(chunk) > 0]
+        chucks = [chunk for chunk in chucks if len(chunk) <= max_chunk_size]
+        return chucks
+
+    def get_embedding(self, text: str) -> list:
+        inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+        # get [CLS] position vector as sentence representation
+        outputs = self.model(**inputs)
+        # 取 [CLS] 位置的向量作为句子表示
+        embedding = outputs.last_hidden_state[:, 0, :].squeeze().tolist()
+        return embedding
+
+
 
 def init_rag():
     # 读取文本数据，切块，分为
@@ -97,29 +115,6 @@ def extract_pdf(pdf_path,data_type):
 
 
 
-
-
-class LLM_Model:
-    def __init__(self):
-        # 语言模型
-        self.model_path = "/mnt/f/ubuntu/deployment/model/Qwen2___5-1___5B-Instruct-GPTQ-Int4"
-        self.language_model = AutoModelForCausalLM(
-            self.model_path,
-            device_map="auto",
-            trust_remote_code=True, # 必须，允许加载qwen的自定义代码
-            local_files_only=True, # 强制在本地加载
-            quantize_config='gptq', # 必须，量化配置
-        )
-        # tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path,trust_remote_code=True,local_files_only=True) # 强制在本地加载tokenizer
-
-    def generate_text(self, prompt, max_length=200):
-        pass
-
-
-
-
-init_rag()
 
 
 query_text = "what material is used for the double wall paper cup?"
