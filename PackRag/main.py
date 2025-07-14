@@ -5,7 +5,7 @@
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
-from transformers import AutoTokenizer, pipeline, AutoModelForCausalLM,AutoModel
+from transformers import AutoTokenizer, pipeline, AutoModelForSequenceClassification ,AutoModel
 from glob import glob
 from pypdf import PdfReader
 import torch
@@ -23,7 +23,7 @@ class RagSystem:
 
         # bge reranker 
         self.reranker_model_name = reranker_model_name
-        self.reranker_model = AutoModel.from_pretrained(self.embedding_model_name,trust_remote_code=True,local_files_only=True)
+        self.reranker_model = AutoModelForSequenceClassification.from_pretrained(self.reranker_model_name,trust_remote_code=True,local_files_only=True)
 
         # vector store
         self.client = QdrantClient(":memory:")  # test mode, user memory mode for real use
@@ -57,16 +57,17 @@ class RagSystem:
         return chucks
 
     def get_embedding(self, text: str) -> list:
-        inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+        inputs = self.tokenizer(text, padding=True, return_tensors="pt", truncation=True, max_length=512)
         # get [CLS] position vector as sentence representation
         outputs = self.model(**inputs)
         # 取 [CLS] 位置的向量作为句子表示
-        embedding = outputs.last_hidden_state[:, 0, :].squeeze().tolist()
+        embedding = outputs.last_hidden_state[:, 0, :].mean(dim=0).tolist()
         return embedding
 
     def save_e(self, points: list):
         self.client.upsert(
             collection_name=self.collection_name,
+            wait=True,
             points=points
         )   
     
@@ -75,25 +76,63 @@ class RagSystem:
         query_embedding = self.get_embedding(query)
         results = self.client.search(
             collection_name=self.collection_name,
-            points=query_embedding,
-            top=top_k,
-            include_distances=True
+            query_vector=query_embedding,
+            limit=top_k
         )
         return results
 
     def rerank(self, query: str, doc_ids: list) -> list:
-        # rerank documents by bge reranker
-        inputs = self.tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=512)
-        outputs = self.reranker_model(**inputs)
-        rerank_scores = outputs.logits.squeeze().tolist()
-        # rerank_scores = [1.0 for _ in doc_ids]  # use uniform score
-        sorted_doc_ids = [doc_id for _, doc_id in sorted(zip(rerank_scores, doc_ids), key=lambda x: x[0], reverse=True)]
+        records = self.client.retrieve(
+            collection_name=self.collection_name,
+            ids=doc_ids,
+            with_payload=True,  # 返回 payload（文档内容）
+            with_vectors=False,  # 不需要向量
+        )
+
+        # 转换为标准格式
+        documents = []
+        for record in records:
+            print(record)
+            documents.append({
+                "id": str(record.id),  # 转回字符串（如果需要）
+                "text": record.payload.get("text", ""),
+                "metadata": record.payload.get("metadata", {}),
+            })
+   
+        if not documents:
+            return []
+        # (query, doc_text)
+        inputs = self.tokenizer(
+            [(query, doc["text"]) for doc in documents],
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+            max_length=512
+        )
+        
+        # get scores for each document
+        with torch.no_grad():
+            outputs = self.reranker_model(**inputs)
+            scores = outputs.logits.squeeze().tolist()  # [score1, score2, ...]
+        if isinstance(scores, float):
+            scores = [scores]
+        sorted_documents = [
+            doc for _, doc in sorted(
+                zip(scores, documents),
+                key=lambda x: x[0],  # 排序 key 是分数
+                reverse=True
+            )
+        ]
+
+        # 提取排序后的 doc_id
+        sorted_doc_ids = [doc["id"] for doc in sorted_documents]
+
         return sorted_doc_ids
 
     def search(self, query: str, top_k: int = 10) -> list:
         # search documents by embedding and reranking
         results = self.search_e(query, top_k)
-        sorted_doc_ids = self.rerank(query, [doc_id for doc_id, _ in results])
+        sorted_doc_ids = self.rerank(query, [dict(doc)['id'] for doc in results])
         return sorted_doc_ids[:top_k]
 
 
@@ -109,13 +148,14 @@ if __name__ == '__main__':
         chunks_list.append(chunks)
     # save embedding to vector store
     points = []
+    
     for i, chunks in enumerate(chunks_list):
-        doc_id = uuid.uuid4().hex
+        doc_id = i
         points.append(
         PointStruct(
             id=doc_id,
             vector = my_rag_system.get_embedding(chunks),
-            payload = {"product_name":"Double wall paper cup"}
+            payload = {"product_name":"Double wall paper cup","text":chunks}
         ))
     my_rag_system.save_e(points)
     
